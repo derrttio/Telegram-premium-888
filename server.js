@@ -6,9 +6,9 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- Хранилище в памяти ---
-let users = [];            // { username, isPremium, lastSeen }
-let messages = [];         // { from, to, text, file, timestamp }
+// Хранилище в памяти
+let users = []; // { username, isPremium }
+let messages = []; // { from, to, text, file, timestamp }
 let groups = [];
 let groupMembers = [];
 let groupMessages = [];
@@ -18,103 +18,97 @@ let channelPosts = [];
 let comments = [];
 let gifts = [];
 
-// Премиум для opex (при старте сервера)
+// Премиум для opex
 if (!users.find(u => u.username === 'opex')) {
-  users.push({ username: 'opex', isPremium: true, lastSeen: Date.now() });
+    users.push({ username: 'opex', isPremium: true });
 } else {
-  const o = users.find(u => u.username === 'opex');
-  if (o) o.isPremium = true;
+    const o = users.find(u => u.username === 'opex');
+    if (o) o.isPremium = true;
 }
 
-const clients = new Map();  // username -> WebSocket
+const clients = new Map();
 
-// ---- Вспомогательные функции для отправки списков ----
+// Функции рассылки
 function broadcastUserList() {
-  const list = Array.from(clients.keys());
-  for (let [username, ws] of clients.entries()) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'user_list', users: list }));
+    const list = Array.from(clients.keys());
+    for (let [username, ws] of clients.entries()) {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'user_list', users: list }));
+        }
     }
-  }
 }
 
 function sendGroupsList(ws, username) {
-  const myGroups = groupMembers
-    .filter(gm => gm.username === username)
-    .map(gm => {
-      const g = groups.find(g => g.id === gm.group_id);
-      return g ? { id: g.id, name: g.name } : null;
-    })
-    .filter(g => g);
-  ws.send(JSON.stringify({ type: 'groups_list', groups: myGroups }));
+    const myGroups = groupMembers
+        .filter(gm => gm.username === username)
+        .map(gm => groups.find(g => g.id === gm.group_id))
+        .filter(g => g);
+    ws.send(JSON.stringify({ type: 'groups_list', groups: myGroups || [] }));
 }
 
 function sendChannelsList(ws, username) {
-  const channelList = channels.map(ch => ({
-    id: ch.id,
-    name: ch.name,
-    owner: ch.owner,
-    subscribers: ch.subscribers,
-    is_subscribed: channelSubs.some(cs => cs.channel_id === ch.id && cs.username === username) ? 1 : 0
-  }));
-  ws.send(JSON.stringify({ type: 'channels_list', channels: channelList }));
+    const channelList = channels.map(ch => ({
+        id: ch.id,
+        name: ch.name,
+        owner: ch.owner,
+        subscribers: ch.subscribers,
+        is_subscribed: channelSubs.some(cs => cs.channel_id === ch.id && cs.username === username) ? 1 : 0
+    }));
+    ws.send(JSON.stringify({ type: 'channels_list', channels: channelList }));
 }
 
 function sendGiftsList(ws, username) {
-  const myGifts = gifts.filter(g => g.to === username).slice(-20);
-  ws.send(JSON.stringify({ type: 'gifts_list', gifts: myGifts }));
+    const myGifts = gifts.filter(g => g.to === username).slice(-20);
+    ws.send(JSON.stringify({ type: 'gifts_list', gifts: myGifts }));
 }
 
-// ---- HTML интерфейс (такой же, как раньше, для краткости оставлен тот же) ----
-// (полный htmlPage такой же, как в предыдущих сообщениях, я его сокращать не буду, 
-//  но вставлю полностью, чтобы ты скопировал и всё работало)
-
+// HTML (сокращённый, но рабочий)
 const htmlPage = `<!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Telegram Premium</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box;}body{background:#0a0c10;font-family:system-ui;height:100vh;overflow:hidden;}
-    .login-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:radial-gradient(circle at 20% 30%,#0f1219,#07090e);}
-    .logo{font-size:32px;font-weight:800;margin-bottom:40px;background:linear-gradient(135deg,#fff,#e6b800);-webkit-background-clip:text;background-clip:text;color:transparent;}
-    .login-card{width:280px;background:rgba(30,34,48,0.8);backdrop-filter:blur(16px);border-radius:28px;padding:20px;border:1px solid rgba(255,215,0,0.3);}
-    .login-card input{width:100%;background:#1e202a;border:1px solid #2a2e3a;border-radius:28px;padding:14px;color:#fff;margin-bottom:16px;}
-    .login-card button{width:100%;background:linear-gradient(135deg,#e6b800,#ffd700);border:none;border-radius:32px;padding:12px;font-weight:bold;color:#121212;}
-    .main{display:flex;height:100vh;}.sidebar{width:320px;background:#17212b;border-right:1px solid #2b2f3a;display:flex;flex-direction:column;}
-    .sidebar-header{padding:16px;border-bottom:1px solid #2b2f3a;}.user-info{display:flex;align-items:center;gap:12px;}
-    .avatar{width:48px;height:48px;border-radius:50%;background:linear-gradient(135deg,#ffd700,#e6b800);display:flex;align-items:center;justify-content:center;font-weight:bold;color:#1e1e2a;}
-    .username{font-weight:600;color:#fff;}.premium-badge{font-size:10px;background:#ffd700;color:#1e1e2a;padding:2px 8px;border-radius:20px;display:inline-block;}
-    .search-bar{padding:12px;}.search-bar input{width:100%;background:#1e202a;border:none;border-radius:24px;padding:10px;color:#fff;}
-    .tabs{display:flex;padding:0 12px;gap:8px;margin-bottom:12px;}.tab{flex:1;background:transparent;border:none;color:#8e9aaf;padding:8px;border-radius:20px;cursor:pointer;}
-    .tab.active{background:#2b5278;color:#fff;}.dynamic-list{flex:1;overflow-y:auto;padding:0 8px;}
-    .item{display:flex;align-items:center;gap:12px;padding:10px;border-radius:14px;margin-bottom:2px;cursor:pointer;}
-    .item:hover{background:#1e2a36;}.item .avatar{width:44px;height:44px;background:#2a2e3a;color:#fff;}.item .name{flex:1;color:#fff;}
-    .action-buttons{padding:16px;display:flex;gap:10px;border-top:1px solid #2b2f3a;}
-    .action-btn{flex:1;background:#2b5278;border:none;border-radius:28px;padding:10px;color:#fff;cursor:pointer;}
-    .chat-area{flex:1;display:flex;flex-direction:column;background:#0e1621;}
-    .chat-header{padding:16px;background:#17212b;border-bottom:1px solid #2b2f3a;color:#fff;font-weight:600;display:flex;justify-content:space-between;}
-    .messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px;}
-    .message{max-width:75%;padding:10px 14px;border-radius:20px;font-size:15px;}
-    .message.out{background:linear-gradient(135deg,#2a6c4e,#1f5a41);color:#fff;align-self:flex-end;}
-    .message.in{background:#1e2a36;color:#fff;align-self:flex-start;}
-    .post{background:#17212b;border-radius:20px;padding:16px;margin-bottom:16px;border-left:3px solid #ffd700;}
-    .post-header{color:#ffd966;font-size:13px;margin-bottom:8px;}
-    .post-text{color:#fff;margin-bottom:12px;}
-    .comments-container{margin-top:12px;padding-left:16px;border-left:2px solid #ffd700;}
-    .comment{background:#1e2a36;border-radius:16px;padding:8px;margin-bottom:8px;}
-    .add-comment{display:flex;gap:8px;margin-top:10px;}
-    .add-comment input{flex:1;background:#1e202a;border:1px solid #2a2e3a;border-radius:28px;padding:8px;color:#fff;}
-    .add-comment button{background:#2b5278;border:none;border-radius:28px;width:44px;cursor:pointer;color:#fff;}
-    .input-area{display:flex;gap:10px;padding:12px;background:#17212b;border-top:1px solid #2b2f3a;}
-    .input-area input{flex:1;background:#1e202a;border:none;border-radius:28px;padding:12px;color:#fff;}
-    .attach-btn,.send-btn,.sticker-btn,.gift-btn{background:#2b5278;border:none;border-radius:32px;width:48px;cursor:pointer;color:#fff;font-size:20px;}
-    .sticker-panel,.gift-panel{position:fixed;bottom:70px;left:0;right:0;background:#17212b;border-radius:20px 20px 0 0;padding:12px;display:flex;flex-wrap:wrap;gap:8px;z-index:100;border-top:1px solid #ffd700;}
-    .sticker{width:60px;height:60px;background:#1e202a;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:40px;cursor:pointer;}
-    .placeholder{text-align:center;color:#6c7883;padding:40px;}
-    @media (max-width:700px){.sidebar{width:80px;}.sidebar .user-details,.sidebar .search-bar,.sidebar .item .name{display:none;}}
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Telegram Premium</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}body{background:#0a0c10;font-family:system-ui;height:100vh;overflow:hidden;}
+.login-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:radial-gradient(circle at 20% 30%,#0f1219,#07090e);}
+.logo{font-size:32px;font-weight:800;margin-bottom:40px;background:linear-gradient(135deg,#fff,#e6b800);-webkit-background-clip:text;background-clip:text;color:transparent;}
+.login-card{width:280px;background:rgba(30,34,48,0.8);backdrop-filter:blur(16px);border-radius:28px;padding:20px;border:1px solid rgba(255,215,0,0.3);}
+.login-card input{width:100%;background:#1e202a;border:1px solid #2a2e3a;border-radius:28px;padding:14px;color:#fff;margin-bottom:16px;}
+.login-card button{width:100%;background:linear-gradient(135deg,#e6b800,#ffd700);border:none;border-radius:32px;padding:12px;font-weight:bold;color:#121212;}
+.main{display:flex;height:100vh;}.sidebar{width:320px;background:#17212b;border-right:1px solid #2b2f3a;display:flex;flex-direction:column;}
+.sidebar-header{padding:16px;border-bottom:1px solid #2b2f3a;}.user-info{display:flex;align-items:center;gap:12px;}
+.avatar{width:48px;height:48px;border-radius:50%;background:linear-gradient(135deg,#ffd700,#e6b800);display:flex;align-items:center;justify-content:center;font-weight:bold;color:#1e1e2a;}
+.username{font-weight:600;color:#fff;}.premium-badge{font-size:10px;background:#ffd700;color:#1e1e2a;padding:2px 8px;border-radius:20px;display:inline-block;}
+.search-bar{padding:12px;}.search-bar input{width:100%;background:#1e202a;border:none;border-radius:24px;padding:10px;color:#fff;}
+.tabs{display:flex;padding:0 12px;gap:8px;margin-bottom:12px;}.tab{flex:1;background:transparent;border:none;color:#8e9aaf;padding:8px;border-radius:20px;cursor:pointer;}
+.tab.active{background:#2b5278;color:#fff;}.dynamic-list{flex:1;overflow-y:auto;padding:0 8px;}
+.item{display:flex;align-items:center;gap:12px;padding:10px;border-radius:14px;margin-bottom:2px;cursor:pointer;}
+.item:hover{background:#1e2a36;}.item .avatar{width:44px;height:44px;background:#2a2e3a;color:#fff;}.item .name{flex:1;color:#fff;}
+.action-buttons{padding:16px;display:flex;gap:10px;border-top:1px solid #2b2f3a;}
+.action-btn{flex:1;background:#2b5278;border:none;border-radius:28px;padding:10px;color:#fff;cursor:pointer;}
+.chat-area{flex:1;display:flex;flex-direction:column;background:#0e1621;}
+.chat-header{padding:16px;background:#17212b;border-bottom:1px solid #2b2f3a;color:#fff;font-weight:600;display:flex;justify-content:space-between;}
+.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px;}
+.message{max-width:75%;padding:10px 14px;border-radius:20px;font-size:15px;}
+.message.out{background:linear-gradient(135deg,#2a6c4e,#1f5a41);color:#fff;align-self:flex-end;}
+.message.in{background:#1e2a36;color:#fff;align-self:flex-start;}
+.post{background:#17212b;border-radius:20px;padding:16px;margin-bottom:16px;border-left:3px solid #ffd700;}
+.post-header{color:#ffd966;font-size:13px;margin-bottom:8px;}
+.post-text{color:#fff;margin-bottom:12px;}
+.comments-container{margin-top:12px;padding-left:16px;border-left:2px solid #ffd700;}
+.comment{background:#1e2a36;border-radius:16px;padding:8px;margin-bottom:8px;}
+.add-comment{display:flex;gap:8px;margin-top:10px;}
+.add-comment input{flex:1;background:#1e202a;border:1px solid #2a2e3a;border-radius:28px;padding:8px;color:#fff;}
+.add-comment button{background:#2b5278;border:none;border-radius:28px;width:44px;cursor:pointer;color:#fff;}
+.input-area{display:flex;gap:10px;padding:12px;background:#17212b;border-top:1px solid #2b2f3a;}
+.input-area input{flex:1;background:#1e202a;border:none;border-radius:28px;padding:12px;color:#fff;}
+.attach-btn,.send-btn,.sticker-btn,.gift-btn{background:#2b5278;border:none;border-radius:32px;width:48px;cursor:pointer;color:#fff;font-size:20px;}
+.sticker-panel,.gift-panel{position:fixed;bottom:70px;left:0;right:0;background:#17212b;border-radius:20px 20px 0 0;padding:12px;display:flex;flex-wrap:wrap;gap:8px;z-index:100;border-top:1px solid #ffd700;}
+.sticker{width:60px;height:60px;background:#1e202a;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:40px;cursor:pointer;}
+.placeholder{text-align:center;color:#6c7883;padding:40px;}
+@media (max-width:700px){.sidebar{width:80px;}.sidebar .user-details,.sidebar .search-bar,.sidebar .item .name{display:none;}}
+</style>
 </head>
 <body>
 <div id="loginScreen" class="login-screen"><div class="logo">✧ Telegram Premium ✧</div><div class="login-card"><input id="username" placeholder="Ваше имя"><button id="loginBtn">Войти</button></div></div>
@@ -166,4 +160,16 @@ function escapeHtml(str){if(!str)return '';return str.replace(/[&<>]/g,m=>m==='&
 
 app.get('/', (req, res) => res.send(htmlPage));
 
-// --- WebSocket обработка (на массивах
+// WebSocket обработка
+wss.on('connection', (ws) => {
+    let currentUser = null;
+    ws.on('message', (data) => {
+        try {
+            const msg = JSON.parse(data);
+            if (msg.type === 'auth') {
+                currentUser = msg.userId;
+                let user = users.find(u => u.username === currentUser);
+                if (!user) {
+                    user = { username: currentUser, isPremium: (currentUser === 'opex') };
+                    users.push(user);
+                } else if (currentUser === 'opex' && !user
