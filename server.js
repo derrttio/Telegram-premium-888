@@ -1,54 +1,73 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const db = new sqlite3.Database('./telegram.db');
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, is_premium INTEGER DEFAULT 0, avatar_color TEXT, last_seen INTEGER)`);
-  db.run(`CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_user TEXT, to_user TEXT, text TEXT, file TEXT, timestamp INTEGER, edited INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0)`);
-  db.run(`CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, created_by TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS group_members (group_id INTEGER, username TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS group_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER, from_user TEXT, text TEXT, file TEXT, timestamp INTEGER)`);
-  db.run(`CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, owner TEXT, subscribers INTEGER DEFAULT 0)`);
-  db.run(`CREATE TABLE IF NOT EXISTS channel_subs (channel_id INTEGER, username TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS channel_posts (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER, author TEXT, text TEXT, file TEXT, timestamp INTEGER)`);
-  db.run(`CREATE TABLE IF NOT EXISTS comments (id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER, author TEXT, text TEXT, timestamp INTEGER)`);
-  db.run(`CREATE TABLE IF NOT EXISTS gifts (id INTEGER PRIMARY KEY AUTOINCREMENT, from_user TEXT, to_user TEXT, gift_type TEXT, timestamp INTEGER)`);
-  db.get(`SELECT id FROM users WHERE username = ?`, ['opex'], (err, row) => {
-    if (!row) db.run(`INSERT INTO users (username, is_premium, avatar_color, last_seen) VALUES (?, ?, ?, ?)`, ['opex', 1, '#ffd700', Date.now()]);
-    else db.run(`UPDATE users SET is_premium = 1 WHERE username = ?`, ['opex']);
-  });
-});
+// --- Хранилище в памяти ---
+let users = [];            // { username, isPremium, lastSeen }
+let messages = [];         // { from, to, text, file, timestamp }
+let groups = [];
+let groupMembers = [];
+let groupMessages = [];
+let channels = [];
+let channelSubs = [];
+let channelPosts = [];
+let comments = [];
+let gifts = [];
 
-const clients = new Map();
+// Премиум для opex (при старте сервера)
+if (!users.find(u => u.username === 'opex')) {
+  users.push({ username: 'opex', isPremium: true, lastSeen: Date.now() });
+} else {
+  const o = users.find(u => u.username === 'opex');
+  if (o) o.isPremium = true;
+}
 
+const clients = new Map();  // username -> WebSocket
+
+// ---- Вспомогательные функции для отправки списков ----
 function broadcastUserList() {
-  const userList = Array.from(clients.keys());
-  for (let [username, ws] of clients.entries()) if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'user_list', users: userList }));
+  const list = Array.from(clients.keys());
+  for (let [username, ws] of clients.entries()) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'user_list', users: list }));
+    }
+  }
 }
 
 function sendGroupsList(ws, username) {
-  db.all(`SELECT g.id, g.name FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.username = ?`, [username], (err, groups) => {
-    if (!err) ws.send(JSON.stringify({ type: 'groups_list', groups: groups || [] }));
-  });
+  const myGroups = groupMembers
+    .filter(gm => gm.username === username)
+    .map(gm => {
+      const g = groups.find(g => g.id === gm.group_id);
+      return g ? { id: g.id, name: g.name } : null;
+    })
+    .filter(g => g);
+  ws.send(JSON.stringify({ type: 'groups_list', groups: myGroups }));
 }
 
 function sendChannelsList(ws, username) {
-  db.all(`SELECT c.id, c.name, c.owner, c.subscribers, (SELECT COUNT(*) FROM channel_subs WHERE channel_id = c.id AND username = ?) AS is_subscribed FROM channels c`, [username], (err, channels) => {
-    if (!err) ws.send(JSON.stringify({ type: 'channels_list', channels: channels || [] }));
-  });
+  const channelList = channels.map(ch => ({
+    id: ch.id,
+    name: ch.name,
+    owner: ch.owner,
+    subscribers: ch.subscribers,
+    is_subscribed: channelSubs.some(cs => cs.channel_id === ch.id && cs.username === username) ? 1 : 0
+  }));
+  ws.send(JSON.stringify({ type: 'channels_list', channels: channelList }));
 }
 
 function sendGiftsList(ws, username) {
-  db.all(`SELECT * FROM gifts WHERE to_user = ? ORDER BY timestamp DESC LIMIT 20`, [username], (err, gifts) => {
-    if (!err) ws.send(JSON.stringify({ type: 'gifts_list', gifts: gifts || [] }));
-  });
+  const myGifts = gifts.filter(g => g.to === username).slice(-20);
+  ws.send(JSON.stringify({ type: 'gifts_list', gifts: myGifts }));
 }
+
+// ---- HTML интерфейс (такой же, как раньше, для краткости оставлен тот же) ----
+// (полный htmlPage такой же, как в предыдущих сообщениях, я его сокращать не буду, 
+//  но вставлю полностью, чтобы ты скопировал и всё работало)
 
 const htmlPage = `<!DOCTYPE html>
 <html lang="ru">
@@ -138,4 +157,13 @@ stickerBtn.onclick=()=>{stickerPanel.style.display=stickerPanel.style.display===
 giftBtn.onclick=()=>{giftPanel.style.display=giftPanel.style.display==='none'?'flex':'none';stickerPanel.style.display='none';};
 document.querySelectorAll('.sticker').forEach(s=>{s.onclick=()=>{let sticker=s.getAttribute('data-sticker')||s.innerText;if(currentChat)ws.send(JSON.stringify({type:currentChat.type+'_message',to:currentChat.id,text:sticker}));stickerPanel.style.display='none';};});
 document.querySelectorAll('[data-gift]').forEach(g=>{g.onclick=()=>{let gift=g.getAttribute('data-gift');if(currentChat&&currentChat.type==='user'){ws.send(JSON.stringify({type:'send_gift',to:currentChat.id,gift}));giftPanel.style.display='none';alert('Подарок отправлен!');}};});
-createGroupBtn.onclick=()=>{
+createGroupBtn.onclick=()=>{let n=prompt('Название группы');if(n)ws.send(JSON.stringify({type:'create_group',name:n}));};
+createChannelBtn.onclick=()=>{let n=prompt('Название канала');if(n)ws.send(JSON.stringify({type:'create_channel',name:n}));};
+document.querySelectorAll('.tab').forEach(btn=>{btn.onclick=()=>{document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentView=btn.getAttribute('data-view');currentChat=null;chatTitle.innerText='📌 '+currentView.toUpperCase();giftBtn.style.display='none';messagesDiv.innerHTML='<div class="placeholder">Выберите чат</div>';if(currentView==='chats')renderUsers();else if(currentView==='groups')renderGroups();else if(currentView==='channels')renderChannels();};});
+function escapeHtml(str){if(!str)return '';return str.replace(/[&<>]/g,m=>m==='&'?'&amp;':m==='<'?'&lt;':'&gt;');}
+</script>
+</body></html>`;
+
+app.get('/', (req, res) => res.send(htmlPage));
+
+// --- WebSocket обработка (на массивах
